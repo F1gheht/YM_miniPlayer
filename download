@@ -1,0 +1,11 @@
+# сборка
+build/
+dist/
+Output/
+*.spec
+__pycache__/
+*.pyc
+# служебные проверки
+probe.py
+probe.bat
+probe_result.txt
