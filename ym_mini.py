@@ -17,6 +17,8 @@ import asyncio
 import threading
 import traceback
 import queue
+import re
+import shutil
 import subprocess
 import urllib.request
 import ctypes
@@ -76,7 +78,7 @@ DEFAULTS = {
     "show_tray": False,
     "ym_control": True,       # кнопки ♥ ⇄ ↻ через порт управления Яндекс Музыки
     "ym_exe": "",
-    "cfg_version": 4,
+    "cfg_version": 5,
 }
 
 
@@ -102,7 +104,10 @@ def load_config():
             cfg["show_tray"] = False
         if ver < 4:
             cfg["popup_on_ym_start"] = False     # окно только по горячей клавише
-            cfg["cfg_version"] = 4
+        if ver < 5:
+            cfg["ym_control"] = True             # кнопки ♥ ⇄ ↻ включены по умолчанию
+        if ver < 5:
+            cfg["cfg_version"] = 5
             save_config(cfg)
     except Exception:
         pass
@@ -217,6 +222,167 @@ def cdp_port_open():
             return True
     except Exception:
         return False
+
+
+# --- ярлыки Яндекс Музыки: сразу запускать её с портом управления, без перезапуска
+
+def ym_exe_guess(known=""):
+    if known and os.path.exists(known):
+        return known
+    d = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "YandexMusic")
+    if os.path.isdir(d):
+        for f in os.listdir(d):
+            if f.lower().endswith(".exe") and is_ym_name(f):
+                return os.path.join(d, f)
+    for p in ym_proc_objects():
+        if p.info.get("exe"):
+            return p.info["exe"]
+    return ""
+
+
+def _shortcut_dirs():
+    env = os.environ.get
+    dirs = [os.path.join(env("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs"),
+            os.path.join(env("APPDATA", ""), r"Microsoft\Internet Explorer\Quick Launch"),
+            os.path.join(env("USERPROFILE", ""), "Desktop"),
+            os.path.join(env("PUBLIC", ""), "Desktop"),
+            os.path.join(env("PROGRAMDATA", ""), r"Microsoft\Windows\Start Menu\Programs")]
+    for od in (env("OneDrive"), env("OneDriveConsumer")):
+        if od:
+            dirs.append(os.path.join(od, "Desktop"))
+            dirs.append(os.path.join(od, "Рабочий стол"))
+    try:   # настоящая папка рабочего стола (бывает перенесена в OneDrive)
+        buf = ctypes.create_unicode_buffer(260)
+        if ctypes.windll.shell32.SHGetFolderPathW(None, 0x0010, None, 0, buf) == 0:
+            dirs.append(buf.value)
+    except Exception:
+        pass
+    seen, res = set(), []
+    for d in dirs:
+        k = os.path.normcase(d)
+        if d and k not in seen and os.path.isdir(d):
+            seen.add(k)
+            res.append(d)
+    return res
+
+
+_FLAG_RE = re.compile(r"\s*--remote-debugging-port=\d+")
+
+
+def _with_flag(args, enable):
+    args = _FLAG_RE.sub("", args or "").strip()
+    return (args + " " + CDP_FLAG).strip() if enable else args
+
+
+def _backup_dir():
+    d = os.path.join(os.path.dirname(config_path()), "shortcut-backup")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _backup_index():
+    try:
+        with open(os.path.join(_backup_dir(), "index.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_backup_index(idx):
+    with open(os.path.join(_backup_dir(), "index.json"), "w", encoding="utf-8") as f:
+        json.dump(idx, f, ensure_ascii=False, indent=1)
+
+
+def patch_ym_launchers(exe, enable):
+    """Добавить (enable=True) или убрать параметр порта в ярлыках и автозапуске Яндекс Музыки.
+    Перед первым изменением ярлык копируется в резерв, при отключении он возвращается как был."""
+    if not IS_WIN:
+        return 0
+    changed = 0
+    idx = _backup_index()
+    if not enable:                               # вернуть сохранённые оригиналы
+        for orig, bak in list(idx.items()):
+            try:
+                if os.path.exists(bak) and os.path.exists(os.path.dirname(orig)):
+                    shutil.copy2(bak, orig)
+                    changed += 1
+                os.remove(bak)
+            except Exception:
+                pass
+            idx.pop(orig, None)
+        _save_backup_index(idx)
+    if exe:
+        import comtypes
+        import comtypes.client
+        comtypes.CoInitialize()
+        try:
+            sh = comtypes.client.CreateObject("WScript.Shell", dynamic=True)
+            exe_n = os.path.normcase(os.path.abspath(exe))
+            for d in _shortcut_dirs():
+                for root, _, files in os.walk(d):
+                    in_pins = "user pinned" in root.lower()
+                    for f in files:
+                        low = f.lower()
+                        if not low.endswith(".lnk"):
+                            continue
+                        if not in_pins and not any(w in low for w in ("яндекс", "yandex", "музык", "music")):
+                            continue
+                        full = os.path.join(root, f)
+                        try:
+                            lnk = sh.CreateShortcut(full)
+                            if os.path.normcase(os.path.abspath(lnk.TargetPath or "?")) != exe_n:
+                                continue
+                            old = lnk.Arguments or ""
+                            new = _with_flag(old, enable)
+                            if new == old:
+                                continue
+                            if enable and full not in idx:
+                                bak = os.path.join(_backup_dir(), f"{len(idx)}_{f}")
+                                shutil.copy2(full, bak)
+                                idx[full] = bak
+                                _save_backup_index(idx)
+                            lnk.Arguments = new
+                            lnk.Save()
+                            changed += 1
+                        except Exception:
+                            pass                    # ярлык только для чтения и т.п. — пропускаем
+        finally:
+            comtypes.CoUninitialize()
+        changed += _patch_run_registry(exe_n, enable)
+    return changed
+
+
+def _patch_run_registry(exe_n, enable):
+    """Если Яндекс Музыка сама стоит в автозагрузке — запускать её и оттуда с портом."""
+    import winreg
+    changed = 0
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                            winreg.KEY_READ | winreg.KEY_SET_VALUE) as k:
+            i, items = 0, []
+            while True:
+                try:
+                    items.append(winreg.EnumValue(k, i))
+                    i += 1
+                except OSError:
+                    break
+            for name, val, typ in items:
+                if name == RUN_NAME or not isinstance(val, str):
+                    continue
+                if exe_n not in os.path.normcase(val):
+                    continue
+                if val.startswith('"'):
+                    end = val.find('"', 1)
+                    head, args = val[:end + 1], val[end + 1:]
+                else:
+                    head, args = val.split(" ", 1)[0], (val.split(" ", 1) + [""])[1]
+                new = (head + " " + _with_flag(args, enable)).strip()
+                if new != val:
+                    winreg.SetValueEx(k, name, 0, typ, new)
+                    changed += 1
+    except Exception:
+        pass
+    return changed
 
 
 def restart_ym_with_port(exe):
@@ -752,6 +918,8 @@ class MediaWorker(QObject):
             await s.try_skip_next_async()
         elif name == "prev":
             await s.try_skip_previous_async()
+        elif name == "play":
+            await s.try_play_async()
         await asyncio.sleep(0.2)
         try:
             await self._poll()
@@ -1267,7 +1435,8 @@ class MiniPlayer(QWidget):
         self.repeat_btn.clicked.connect(lambda: self._ext_click("repeat"))
         self.like_btn.clicked.connect(lambda: self._ext_click("like"))
         for b in (self.shuffle_btn, self.repeat_btn, self.like_btn):
-            b.setVisible(False)          # появятся, когда подключимся к приложению
+            b.setEnabled(False)          # заработают, когда подключимся к приложению
+            b.setToolTip("Подключаюсь к Яндекс Музыке…")
 
         controls = QHBoxLayout()
         controls.setSpacing(8)
@@ -1364,6 +1533,7 @@ class MiniPlayer(QWidget):
         self._tl_timer = QTimer(self, interval=250, timeout=self._tick_timeline)
 
         self.set_state({"ok": False})
+        self.set_ext(None)
         self._tick_timeline()
 
     # --- состояние
@@ -1400,16 +1570,21 @@ class MiniPlayer(QWidget):
     # --- кнопки самой Яндекс Музыки
     def set_ext(self, st):
         self._ext = st
+        show = bool(self.cfg.get("ym_control", True))
+        for b in (self.shuffle_btn, self.repeat_btn, self.like_btn):
+            b.setVisible(show)
         if not st:
             for b in (self.shuffle_btn, self.repeat_btn, self.like_btn):
-                b.setVisible(False)
+                b.setEnabled(False)
+                b.setActive(False)
+                b.setToolTip("Подключаюсь к Яндекс Музыке…" if self.ym_open or not show
+                             else "Откройте Яндекс Музыку")
             return
         for name, btn, tips in (
                 ("like", self.like_btn, ("Нравится", "Не нравится (убрать из «Мне нравится»)")),
                 ("shuffle", self.shuffle_btn, ("Перемешать", "Выключить перемешивание")),
                 ("repeat", self.repeat_btn, ("Повтор", "Повтор"))):
             info = st.get(name) or {}
-            btn.setVisible(True)
             ok = bool(info.get("found")) and not info.get("disabled")
             btn.setEnabled(ok)
             on = _btn_on(info)
@@ -1904,6 +2079,11 @@ class Controller(QObject):
         self.bridge.state_changed.connect(self.player.set_ext)
         self.player.ext_action.connect(self.bridge.click)
         self._last_restart = 0.0
+        self._restart_fails = 0
+        self._resume = None
+        self._patch_timer = QTimer(self, interval=10 * 60 * 1000, timeout=self.patch_launchers)
+        self._patch_timer.start()
+        QTimer.singleShot(2000, self.patch_launchers)
 
         self.hotkeys = HotkeyManager()
         self.hotkeys.triggered.connect(self.on_hotkey)
@@ -1972,10 +2152,16 @@ class Controller(QObject):
             self.tray.hide()
 
     def _ensure_port(self):
-        """Яндекс Музыку только что открыли без порта управления — сразу перезапускаем с ним."""
-        if not self.cfg.get("ym_control") or self.bridge.connected:
+        """Яндекс Музыка запущена без порта управления (кнопок ♥ ⇄ ↻ нет) — перезапускаем её с портом.
+        Если что-то играло, после перезапуска продолжим с того же места."""
+        if not self.cfg.get("ym_control"):
             return
-        if time.time() - self._last_restart < 60:
+        if self.bridge.connected:
+            self._restart_fails = 0
+            return
+        if self._restart_fails >= 2:
+            return                                # приложение не открывает порт — не мучаем его
+        if time.time() - self._last_restart < 45:
             return
         procs = ym_proc_objects()
         if not procs:
@@ -1990,12 +2176,32 @@ class Controller(QObject):
                         return                    # уже с портом — просто ждём подключения
                 except Exception:
                     pass
-        age = time.time() - min(p.info.get("create_time") or time.time() for p in procs)
-        if age < 25 and not cdp_port_open():
+        if not cdp_port_open():
+            self._restart_fails += 1
             self.restart_ym()
 
+    def patch_launchers(self):
+        enable = bool(self.cfg.get("ym_control", True))
+        known = self.cfg.get("ym_exe", "")
+
+        def work():
+            try:
+                patch_ym_launchers(ym_exe_guess(known), enable)
+            except Exception:
+                log_error("patch shortcuts", traceback.format_exc())
+        threading.Thread(target=work, daemon=True).start()
+
     def restart_ym(self, manual=False):
+        if manual:
+            self._restart_fails = 0
         self._last_restart = time.time()
+        st = self.media._last_state or {}
+        if st.get("ok") and st.get("playing"):
+            # запомнить, что играло, чтобы продолжить после перезапуска
+            self._resume = {"title": st.get("title"), "artist": st.get("artist"),
+                            "pos": self.player.current_pos(), "until": time.time() + 40}
+        else:
+            self._resume = None
         threading.Thread(target=restart_ym_with_port, args=(self.cfg.get("ym_exe"),),
                          daemon=True).start()
 
@@ -2021,6 +2227,17 @@ class Controller(QObject):
     def _on_state(self, st):
         self._media_ym = bool(st.get("ok") and st.get("ym"))
         self.player.set_state(st)
+        r = self._resume
+        if r and time.time() > r["until"]:
+            self._resume = r = None
+        if (r and st.get("ok") and time.time() - self._last_restart > 3
+                and st.get("title") == r["title"] and st.get("artist") == r["artist"]):
+            self._resume = None
+            if not st.get("playing"):
+                self.media.command("play")
+            pos = r["pos"]
+            if pos > 2:
+                QTimer.singleShot(900, lambda: self.media.seek(pos))
 
     def _on_second_instance(self):
         sock = self.server.nextPendingConnection()
@@ -2100,6 +2317,8 @@ class Controller(QObject):
         dlg = SettingsDialog(self.cfg)
         if dlg.exec_() == QDialog.Accepted:
             save_config(self.cfg)
+            self.patch_launchers()            # включили/выключили кнопки — поправить ярлыки
+            self.player.set_ext(self.player._ext)
             self.media.fallback = bool(self.cfg["any_player_fallback"])
             self._update_tooltip()
             if self.cfg["launch_with_ym"]:
@@ -2155,6 +2374,12 @@ SERVER_NAME = "YMMini-" + (os.environ.get("USERNAME") or os.environ.get("USER") 
 
 
 def main():
+    if "--unpatch" in sys.argv:              # вызывается деинсталлятором
+        try:
+            patch_ym_launchers(ym_exe_guess(load_config().get("ym_exe", "")), False)
+        except Exception:
+            log_error("unpatch", traceback.format_exc())
+        return
     if IS_WIN:
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("YMMini")
