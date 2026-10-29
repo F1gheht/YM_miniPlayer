@@ -26,7 +26,7 @@ from ctypes import wintypes
 
 from PyQt5.QtCore import (Qt, QObject, QEvent, pyqtSignal, QTimer, QPoint, QPointF, QRectF,
                           QPropertyAnimation, QEasingCurve)
-from PyQt5.QtGui import (QPainter, QColor, QPixmap, QPainterPath, QIcon, QFont, QPolygonF,
+from PyQt5.QtGui import (QPainter, QColor, QPixmap, QImage, QPainterPath, QIcon, QFont, QPolygonF,
                          QPen, QCursor, QLinearGradient)
 from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QSlider, QHBoxLayout,
                              QVBoxLayout, QAbstractButton, QSystemTrayIcon, QMenu, QAction,
@@ -830,19 +830,21 @@ class MediaWorker(QObject):
         playing = int(info.playback_status) == 4          # 4 = Playing
         title, artist = props.title or "", props.artist or ""
         key = (title, artist)
-        first = False
         if key != self._key:
-            self._key, self._thumb_reads, first = key, 4, True
-        # обложка часто приходит чуть позже названия — читаем её несколько раз
-        if self._thumb_reads > 0:
-            self._thumb_reads -= 1
+            # новый трек: обложка приходит позже названия, иногда через несколько секунд,
+            # а первые чтения ещё могут вернуть картинку прошлого трека
+            self._key, self._thumb_reads, self._old_cover = key, 24, self._cover
+            self._polls = 0
+        self._polls = getattr(self, "_polls", 0) + 1
+        if self._thumb_reads > 0 or self._polls % 20 == 0:   # 12 с после смены трека, потом раз в 10 с
+            self._thumb_reads = max(0, self._thumb_reads - 1)
             data = await self._read_thumb(props.thumbnail)
-            if data:
-                if data != self._cover:
-                    self._cover = data
-                    self.cover_changed.emit(data)
-            elif first and self._cover:
-                self._cover = b""
+            waited = 24 - self._thumb_reads              # сколько чтений прошло (по 0,5 с)
+            if data and data != self._cover and (data != self._old_cover or waited >= 6):
+                self._cover = data
+                self.cover_changed.emit(data)
+            elif not data and waited >= 6 and self._cover and self._cover == self._old_cover:
+                self._cover = b""                       # у нового трека обложки нет — убрать старую
                 self.cover_changed.emit(b"")
         self._emit({"ok": True, "ym": is_ym, "title": title, "artist": artist, "playing": playing})
 
@@ -873,23 +875,41 @@ class MediaWorker(QObject):
         try:
             stream = await ref.open_read_async()
             size = int(stream.size)
-            if size <= 0:
+            if size <= 0 or size > 20_000_000:
                 return b""
-            buf = await stream.read_async(self._Buffer(size), size, self._ISO.READ_AHEAD)
+            data = bytearray()
+            while len(data) < size:                      # Windows может отдать картинку частями
+                left = size - len(data)
+                buf = await stream.read_async(self._Buffer(left), left, self._ISO.READ_AHEAD)
+                chunk = self._buf_bytes(buf)
+                if not chunk:
+                    break
+                data += chunk
             try:
-                data = bytes(memoryview(buf))
-                if data:
-                    return data
-            except TypeError:
+                stream.close()
+            except Exception:
                 pass
-            reader = self._DataReader.from_buffer(buf)
-            arr = bytearray(buf.length)
-            res = reader.read_bytes(arr)
-            if isinstance(res, (bytes, bytearray, list)) and len(res):
-                return bytes(res)
-            return bytes(arr)
+            if len(data) < size:
+                return b""
+            img = QImage()
+            return bytes(data) if img.loadFromData(bytes(data)) else b""   # только целые картинки
         except Exception:
             return b""
+
+    def _buf_bytes(self, buf):
+        try:
+            return bytes(memoryview(buf))
+        except TypeError:
+            pass
+        n = int(buf.length)
+        if not n:
+            return b""
+        reader = self._DataReader.from_buffer(buf)
+        arr = bytearray(n)
+        res = reader.read_bytes(arr)
+        if isinstance(res, (bytes, bytearray, list)) and len(res):
+            return bytes(res)
+        return bytes(arr)
 
     def command(self, name):
         if self.loop:
@@ -948,7 +968,10 @@ const info = el => !el ? {found: false} : {
   disabled: !!(el.disabled || el.getAttribute('aria-disabled') === 'true' || el.getAttribute('data-disabled') === 'true'),
   cls: String(el.className || '')
 };
-return JSON.stringify({like: info(find.like()), shuffle: info(find.shuffle()), repeat: info(find.repeat())});
+const img = bar.querySelector('[data-test-id*="COVER"] img, img[data-test-id*="COVER"]') || bar.querySelector('img');
+const cover = img ? (img.currentSrc || img.src || '') : '';
+return JSON.stringify({like: info(find.like()), shuffle: info(find.shuffle()), repeat: info(find.repeat()),
+                       cover: cover});
 })()"""
 
 CLICK_JS = "(() => {" + _FIND_JS + r"""
@@ -978,9 +1001,11 @@ class YMBridge(QObject):
     """Подключение к Яндекс Музыке через её отладочный порт: читает и нажимает
     кнопки «Нравится», «Перемешать», «Повтор» прямо в приложении."""
     state_changed = pyqtSignal(object)       # dict или None (нет подключения)
+    cover_ready = pyqtSignal(bytes)          # обложка из самого приложения (b"" — нет)
 
     def __init__(self):
         super().__init__()
+        self._cover_url = None
         self._q = queue.Queue()
         self._ws = None
         self._id = 0
@@ -1021,11 +1046,38 @@ class YMBridge(QObject):
             if msg.get("id") == my:
                 return msg.get("result", {}).get("result", {}).get("value")
 
+    def _update_cover(self, url):
+        if url == self._cover_url:
+            return
+        self._cover_url = url
+        if not url.startswith("http"):
+            self.cover_ready.emit(b"")
+            return
+        urls = [url]
+        if "avatars." in url:                          # попросить картинку покрупнее
+            big = re.sub(r"/\d+x\d+(?=$|\?)", "/400x400", url)
+            if big != url:
+                urls.insert(0, big)
+        for u in urls:
+            try:
+                req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0 YMMini"})
+                with urllib.request.urlopen(req, timeout=6) as r:
+                    data = r.read(8_000_000)
+                if data and QImage().loadFromData(data):
+                    if url == self._cover_url:              # трек не успел смениться
+                        self.cover_ready.emit(data)
+                    return
+            except Exception:
+                continue
+        if url == self._cover_url:
+            self.cover_ready.emit(b"")
+
     def _run(self):
         while True:
             try:
                 if self._ws is None:
                     self.connected = False
+                    self._cover_url = None
                     self._connect()
                 if self._ws is None:
                     while not self._q.empty():
@@ -1042,7 +1094,10 @@ class YMBridge(QObject):
                     self._eval(CLICK_JS % json.dumps(cmd))
                     time.sleep(0.15)
                 val = self._eval(STATE_JS)
-                self._emit(json.loads(val) if val else None)
+                st = json.loads(val) if val else None
+                if st is not None:
+                    self._update_cover(st.pop("cover", "") or "")
+                self._emit(st)
             except Exception:
                 try:
                     self._ws and self._ws.close()
@@ -1520,6 +1575,9 @@ class MiniPlayer(QWidget):
         self._playing = False
         self._muted = False
         self._ext = None
+        self._cover_smtc = b""
+        self._cover_app = None
+        self._cover_shown = None
         self.ym_open = False
         self._drag = None
         self._hiding = False
@@ -1548,7 +1606,8 @@ class MiniPlayer(QWidget):
             else:
                 self.title.setFullText(st.get("title") or "Яндекс Музыка не найдена")
                 self.artist.setFullText(st.get("artist") or "Запустите приложение и включите трек")
-            self.cover.setImage(b"")
+            self._cover_smtc = b""
+            self._show_cover()
             self.set_playing(False)
             return
         self.title.setFullText(st.get("title") or "Без названия")
@@ -1556,7 +1615,20 @@ class MiniPlayer(QWidget):
         self.set_playing(bool(st.get("playing")))
 
     def set_cover(self, data):
-        self.cover.setImage(data)
+        """Обложка, которую Яндекс Музыка передала в Windows (запасной источник)."""
+        self._cover_smtc = data
+        self._show_cover()
+
+    def set_cover_app(self, data):
+        """Обложка прямо из приложения (через порт управления) — точнее и крупнее."""
+        self._cover_app = data or None
+        self._show_cover()
+
+    def _show_cover(self):
+        data = self._cover_app if (self._cover_app and self._ext is not None) else self._cover_smtc
+        if data != self._cover_shown:
+            self._cover_shown = data
+            self.cover.setImage(data)
 
     def set_playing(self, playing):
         self._playing = playing
@@ -1570,6 +1642,9 @@ class MiniPlayer(QWidget):
     # --- кнопки самой Яндекс Музыки
     def set_ext(self, st):
         self._ext = st
+        if st is None:
+            self._cover_app = None
+        self._show_cover()
         show = bool(self.cfg.get("ym_control", True))
         for b in (self.shuffle_btn, self.repeat_btn, self.like_btn):
             b.setVisible(show)
@@ -2077,6 +2152,7 @@ class Controller(QObject):
 
         self.bridge = YMBridge()
         self.bridge.state_changed.connect(self.player.set_ext)
+        self.bridge.cover_ready.connect(self.player.set_cover_app)
         self.player.ext_action.connect(self.bridge.click)
         self._last_restart = 0.0
         self._restart_fails = 0
