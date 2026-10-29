@@ -78,6 +78,7 @@ DEFAULTS = {
     "show_tray": False,
     "ym_control": True,       # кнопки ♥ ⇄ ↻ через порт управления Яндекс Музыки
     "ym_exe": "",
+    "mixer_reset_done": False,
     "cfg_version": 5,
 }
 
@@ -957,6 +958,10 @@ const find = {
   like:    () => bar.querySelector('[data-test-id="LIKE_BUTTON"]') || byAria(/^нравится$/i),
   shuffle: () => bar.querySelector('[data-test-id*="SHUFFLE"]') || byAria(/перемеш|shuffle/i),
   repeat:  () => bar.querySelector('[data-test-id*="REPEAT"]') || byAria(/повтор|repeat/i),
+  volume:  () => bar.querySelector('[data-test-id="CHANGE_VOLUME_SLIDER"]')
+                 || document.querySelector('[data-test-id="CHANGE_VOLUME_SLIDER"]'),
+  mute:    () => bar.querySelector('[data-test-id="CHANGE_VOLUME_BUTTON"]')
+                 || document.querySelector('[data-test-id="CHANGE_VOLUME_BUTTON"]'),
 };
 """
 
@@ -970,8 +975,27 @@ const info = el => !el ? {found: false} : {
 };
 const img = bar.querySelector('[data-test-id*="COVER"] img, img[data-test-id*="COVER"]') || bar.querySelector('img');
 const cover = img ? (img.currentSrc || img.src || '') : '';
+const vs = find.volume(), mb = find.mute();
+const vmin = vs ? (parseFloat(vs.min) || 0) : 0;
+const vmax = vs ? (vs.max !== '' && !isNaN(parseFloat(vs.max)) ? parseFloat(vs.max) : 1) : 1;
+const volume = vs ? {found: true, value: parseFloat(vs.value) || 0, min: vmin, max: vmax,
+                     muted: !!(mb && /включить/i.test(mb.getAttribute('aria-label') || ''))} : {found: false};
 return JSON.stringify({like: info(find.like()), shuffle: info(find.shuffle()), repeat: info(find.repeat()),
-                       cover: cover});
+                       volume: volume, cover: cover});
+})()"""
+
+SETVOL_JS = "(() => {" + _FIND_JS + r"""
+const el = find.volume();
+if (!el) return 'missing';
+const min = parseFloat(el.min) || 0;
+const max = (el.max !== '' && !isNaN(parseFloat(el.max))) ? parseFloat(el.max) : 1;
+const v = min + (max - min) * %f;
+// так значение меняет React-приложение: через «родной» сеттер и событие input
+const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+setter.call(el, String(v));
+el.dispatchEvent(new Event('input', {bubbles: true}));
+el.dispatchEvent(new Event('change', {bubbles: true}));
+return 'ok';
 })()"""
 
 CLICK_JS = "(() => {" + _FIND_JS + r"""
@@ -1016,6 +1040,10 @@ class YMBridge(QObject):
     def click(self, name):
         if self.connected:
             self._q.put(name)
+
+    def set_volume(self, frac):
+        if self.connected:
+            self._q.put(("volume", max(0.0, min(1.0, float(frac)))))
 
     def _emit(self, st):
         if st != self._last:
@@ -1086,13 +1114,23 @@ class YMBridge(QObject):
                     time.sleep(2)
                     continue
                 self.connected = True
+                cmds = []
                 try:
-                    cmd = self._q.get(timeout=0.6)
+                    cmds.append(self._q.get(timeout=0.25))
+                    while True:
+                        cmds.append(self._q.get_nowait())
                 except queue.Empty:
-                    cmd = None
-                if cmd:
-                    self._eval(CLICK_JS % json.dumps(cmd))
-                    time.sleep(0.15)
+                    pass
+                vol = None
+                for cmd in cmds:
+                    if isinstance(cmd, tuple):
+                        vol = cmd[1]                       # от ползунка важна только последняя позиция
+                    else:
+                        self._eval(CLICK_JS % json.dumps(cmd))
+                if vol is not None:
+                    self._eval(SETVOL_JS % vol)
+                if cmds:
+                    time.sleep(0.1)
                 val = self._eval(STATE_JS)
                 st = json.loads(val) if val else None
                 if st is not None:
@@ -1452,6 +1490,7 @@ class MiniPlayer(QWidget):
     seek_requested = pyqtSignal(float)
     menu_requested = pyqtSignal(QPoint)
     ext_action = pyqtSignal(str)
+    app_volume = pyqtSignal(float)
     W, H = 360, 162
 
     def __init__(self, cfg, volume):
@@ -1576,6 +1615,7 @@ class MiniPlayer(QWidget):
         self._muted = False
         self._ext = None
         self._cover_smtc = b""
+        self._vol_local_change = 0.0
         self._cover_app = None
         self._cover_shown = None
         self.ym_open = False
@@ -1645,6 +1685,8 @@ class MiniPlayer(QWidget):
         if st is None:
             self._cover_app = None
         self._show_cover()
+        if self.isVisible():
+            self._sync_volume()
         show = bool(self.cfg.get("ym_control", True))
         for b in (self.shuffle_btn, self.repeat_btn, self.like_btn):
             b.setVisible(show)
@@ -1732,8 +1774,23 @@ class MiniPlayer(QWidget):
         self.seek_to(self.current_pos() + delta)
 
     # --- громкость
+    def _app_volume(self):
+        """Громкость самой Яндекс Музыки (её ползунок), если есть подключение к приложению."""
+        av = (self._ext or {}).get("volume") or {}
+        if not av.get("found"):
+            return None
+        rng = (av.get("max", 1) - av.get("min", 0)) or 1
+        return max(0.0, min(1.0, (av.get("value", 0) - av.get("min", 0)) / rng)), bool(av.get("muted"))
+
     def _sync_volume(self):
-        v, muted = self.volume.get()
+        app = self._app_volume()
+        if app is not None:
+            if time.monotonic() - self._vol_local_change < 1.5:
+                return                    # только что двигали сами — ждём, пока приложение догонит
+            v, muted = app
+            self.slider.setToolTip("Громкость Яндекс Музыки")
+        else:
+            v, muted = self.volume.get()
         has = v is not None
         self.slider.setEnabled(has)
         self.speaker.setEnabled(has)
@@ -1741,7 +1798,8 @@ class MiniPlayer(QWidget):
             self.vol_label.setText("—")
             self.slider.setToolTip("Громкость появится, когда Яндекс Музыка начнёт воспроизведение")
             return
-        self.slider.setToolTip("")
+        if app is None:
+            self.slider.setToolTip("Громкость Яндекс Музыки в микшере Windows")
         self._muted = muted
         if not self.slider.isSliderDown():
             self.slider.blockSignals(True)
@@ -1755,7 +1813,11 @@ class MiniPlayer(QWidget):
         self.speaker.setState(val / 100, self._muted)
 
     def _on_slider(self, val):
-        self.volume.set(val / 100)
+        if self._app_volume() is not None:
+            self._vol_local_change = time.monotonic()
+            self.app_volume.emit(val / 100)
+        else:
+            self.volume.set(val / 100)
         if val > 0:
             self._muted = False
         self._update_vol_ui()
@@ -1767,7 +1829,11 @@ class MiniPlayer(QWidget):
 
     def _toggle_mute(self):
         self._muted = not self._muted
-        self.volume.set_mute(self._muted)
+        if self._app_volume() is not None:
+            self._vol_local_change = time.monotonic()
+            self.ext_action.emit("mute")
+        else:
+            self.volume.set_mute(self._muted)
         self._update_vol_ui()
 
     def wheelEvent(self, e):
@@ -2153,6 +2219,8 @@ class Controller(QObject):
         self.bridge = YMBridge()
         self.bridge.state_changed.connect(self.player.set_ext)
         self.bridge.cover_ready.connect(self.player.set_cover_app)
+        self.player.app_volume.connect(self.bridge.set_volume)
+        self.bridge.state_changed.connect(self._on_bridge_state)
         self.player.ext_action.connect(self.bridge.click)
         self._last_restart = 0.0
         self._restart_fails = 0
@@ -2299,6 +2367,18 @@ class Controller(QObject):
             else:
                 self.manual = False
         self._apply_active()
+
+    def _on_bridge_state(self, st):
+        # Раньше ползунок менял громкость в микшере Windows. Теперь он управляет ползунком
+        # самой Яндекс Музыки, поэтому громкость в микшере один раз возвращаем на 100 %,
+        # иначе музыка останется тихой даже на максимуме.
+        if st and (st.get("volume") or {}).get("found") and not self.cfg.get("mixer_reset_done"):
+            self.volume._ts = 0
+            v, _ = self.volume.get()
+            if v is not None:
+                self.volume.set(1.0)
+                self.cfg["mixer_reset_done"] = True
+                save_config(self.cfg)
 
     def _on_state(self, st):
         self._media_ym = bool(st.get("ok") and st.get("ym"))
